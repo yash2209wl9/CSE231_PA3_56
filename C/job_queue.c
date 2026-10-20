@@ -9,8 +9,8 @@ int queue_init(job_queue_t *q)
     }
 
     q->head = 0;
-    q->tail = 0;
-    q->count = 0;
+    q->tail =0;
+    q->count= 0;
     q->shutdown = 0;
 
     /* TODO C3:
@@ -18,6 +18,21 @@ int queue_init(job_queue_t *q)
      * If an initialization fails, clean up anything already initialized
      * and return -1. Return 0 on success.
      */
+    if (pthread_mutex_init(&q->mutex, NULL) != 0) {
+        return -1;
+    }
+
+    if (pthread_cond_init(&q->not_empty, NULL) !=0) {
+        pthread_mutex_destroy(&q->mutex); //cleanup mutex if cond fails
+        return -1;
+    }
+
+    if (pthread_cond_init(&q->not_full,NULL) != 0) {
+        pthread_cond_destroy(&q->not_empty); //have to destroy both if 2nd cond fails
+        pthread_mutex_destroy(&q->mutex);
+        return -1;
+    }
+    // invariant is 0 <= count <= QUEUE_CAPACITY
 
     return 0;
 }
@@ -29,6 +44,9 @@ void queue_destroy(job_queue_t *q)
     }
 
     /* TODO C4: destroy the mutex and both condition variables. */
+    pthread_cond_destroy(&q->not_full);
+    pthread_cond_destroy(&q->not_empty);
+    pthread_mutex_destroy(&q->mutex); //only call after all threads joined
 }
 
 int queue_push(job_queue_t *q, int job)
@@ -47,9 +65,28 @@ int queue_push(job_queue_t *q, int job)
      *
      * IMPORTANT: pthread_cond_wait() must be guarded by a while loop.
      */
+    pthread_mutex_lock(&q->mutex);
 
-    (void)job;
-    return -1;
+// need while loop here instead of if because of mesa semantics where another thread might grab the slot before we wake up and get the lock back
+    while (q->count == QUEUE_CAPACITY && q->shutdown ==0) {
+        pthread_cond_wait(&q->not_full, &q->mutex); //atomically unlocks mutex and sleeps
+    }
+    // recheck condition after wakeup in case of spurious wakeup
+
+    if (q->shutdown != 0) { //dont push if shutting down
+        pthread_mutex_unlock(&q->mutex);
+        return -1;
+    }
+
+    q->jobs[q->tail]= job;
+    q->tail = (q->tail + 1) % QUEUE_CAPACITY; //wrap around MAX=8
+    q->count = q->count+ 1;
+    // fill = (fill + 1) % MAX from lec 13 slides
+
+    pthread_cond_signal(&q->not_empty); //wake one sleeping consumer
+    pthread_mutex_unlock(&q->mutex);
+
+    return 0;
 }
 
 int queue_pop(job_queue_t *q, int *job)
@@ -66,8 +103,28 @@ int queue_pop(job_queue_t *q, int *job)
      * 5. Signal a producer through not_full.
      * 6. Unlock and return 1.
      */
+    pthread_mutex_lock(&q->mutex);
 
-    return 0;
+    while (q->count ==0 && q->shutdown == 0) {
+        pthread_cond_wait(&q->not_empty, &q->mutex); //sleep if empty
+    }
+
+// only exit when both shutdown is 1 and count is 0 otherwise we still have leftover jobs in the buffer that need to be drained first
+    if (q->count == 0 && q->shutdown != 0) {
+        pthread_mutex_unlock(&q->mutex); //remember to unlock before returning 0 or it deadlocks
+        return 0;
+    }
+
+    int val = q->jobs[q->head];
+    *job =val;
+    q->head = (q->head+ 1) % QUEUE_CAPACITY; //use = (use + 1) % MAX
+    q->count--; // decrement count inside lock
+    // head tail and count all updated under same mutex
+
+    pthread_cond_signal(&q->not_full); //wake producer waiting for space
+    pthread_mutex_unlock(&q->mutex);
+
+    return 1;
 }
 
 void queue_shutdown(job_queue_t *q)
@@ -85,4 +142,10 @@ void queue_shutdown(job_queue_t *q)
      * Explain in answers.txt why broadcast(), rather than signal(),
      * is appropriate during shutdown.
      */
+    pthread_mutex_lock(&q->mutex);
+    q->shutdown= 1; //set under lock so no lost wakeup race between check and cond_wait
+// using broadcast instead of signal so all 4 printer threads wake up when count is 0 instead of just one waking up and the rest hanging in join forever
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_cond_broadcast(&q->not_full); //in case a producer is stuck too
+    pthread_mutex_unlock(&q->mutex);
 }

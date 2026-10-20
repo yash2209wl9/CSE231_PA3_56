@@ -1,6 +1,6 @@
 Programming Assignment: Processes, Threads, and Synchronization
-Name:
-Roll number:
+Name:Parag Prasun
+Roll number:2025354
 
 A-Q1. Why should execvp() normally be called in the child rather than the shell process?
 
@@ -21,21 +21,38 @@ B-Q3. Why can the unsafe program sometimes appear to produce the expected result
 
 
 C-Q1. Why must queue head, tail, and count be protected by the same mutex?
+Answer:
+If queue head,tail,and count are not protected than, race condition may apply which will lead to overwrite of one over another. Than(for ex), if thread created 1 more process but consumer also worked and decreased write count by 1(reading like count head tail)
+ So, metadata is corrupted and will drift away and most of the time will give wrong results which will result in inconsistent intermidiate state to other threads. Now(in general), this will go beyond the indexes mapping if it is not capped between 0 to queue capacity.So, to stop the random flow of code, we need same mutex.
 
-
-C-Q2. Why must releasing the mutex and sleeping in pthread_cond_wait() behave atomically?
+C-Q2. pthread_cond_wait() conceptually releases the mutex and sleeps, then reacquires the mutex on wake-up. Why must the release-and-sleep transition be atomic?
+Answer:
+If releasing the mutex and then sending them to sleep were two seprate, non-atomic operation, a race condition of lost wake-up condition would occur a the thread sees that the condition is false and unlocks the mutex. Now, another thread(os activate him) sees that condition(while thread is going to sleep in next stage), now insert the next thread in queue and now mutex is also locked. Now, mutex is locked and only we opened when queue is zero and a thread will unlock it but it is now impossible as the upcoming thread will see that queue is there and will chain after the front one and this chain can't be moved. So, deadlock condition is there and nothing can open the mutex. So, till eternity, first thread resumes and goes to sleep indefinity and no other signal arrives as no wake-up signal is going to be there.Making the release  of the lockand putting the thread to sleep atomic atomic ensure the thread can't miss a singal that occurs after it decides to wait.
 
 
 C-Q3. Why must the condition around pthread_cond_wait() be checked with while rather than if?
+Answer:
+If we use if loop instead of while than, signal wakes up the thread but in mesa semantics(which pthreads has) waking up only moves thread to ready queue, it doesn't give mutex immediately.
+So between the processes , another thread can also run first and fetch the mutex and get the job or fill the slot first. Now, when thread obtains the lock back, queue is empty(orfull) again but because of if condition it won't check and will directly try to pop or push which corrupts head/tail or reads wrong data. Than also spurious wakeup can happen where thread wakes up randomly without any signal.Hence, we need a loop keep watching over it to check after wakeup before touching the buffer.
 
 
-C-Q4. Why is pthread_cond_broadcast() appropriate during queue shutdown?
+C-Q4. Why is pthread_cond_broadcast(&q->not_empty) appropriate during shutdown? What could go wrong with waking only one waiting consumer?
+Answer:
+When shutdown happens, all 4 printer threads might be sleeping on not_empty waiting for jobs. Now, if we use signal than it only wakes up 1 consumer thread(while others are still sleeping). That one thread wakes up, sees count is 0 and shutdown is 1, and exits. But now, other 3 printer threads are still sleeping and no new jobs will be inserted in queue by producers, so no wake-up signal is going to be there. So, the upcoming thread will chain after the front one and this chain can't be moved, so other threads will stay sleeping in cond_wait till eternity. So, deadlock condition is there when main tries to join and nothing can open them. So, to stop this random flow of code, we need broadcast to wake all 4 printer threads together so all threads see shutdown is 1 and exit instead of hanging forever.
 
 
 C-Q5. Why is a condition variable preferable to busy waiting when the queue is empty for a long time?
+Answer:
+If thread repeatedly locks, checks count, and unlocks in a loop than it is just busy-waiting/spinning and burns its whole CPU time slice for doing nothing. Now, another thread(like producer) also wants to insert in queue, but mutex is locked again and again by the spinning thread, so metadata is blocked and producer will drift away and get delayed in inconsistent intermidiate state. Now(in general), condition variable is much better because pthread_cond_wait sends them to sleep in blocked state so it consumes zero CPU, and only wakes up when producer actually inserts in queue and sends wake-up signal.
 
 
-C-Q6. Why can per-worker jobs_completed counters reduce synchronization overhead compared with one shared global counter?
+C-Q6. The final server stores jobs_completed per worker. What synchronization overhead does this avoid compared with one frequently updated global completion counter?
+Answer:
+If all 4 workers updated one single global counter than, race condition may apply on every 1ms print so each worker has to lock mutex or atomic increment. Now, every thread will chain after the same lock and fight for memory, so cache line gets invalidated across CPU cores and will drift away with heavy contention. Now(in general), giving private jobs_completed in worker struct stops this random flow of code while running, because each thread writes its own count with zero mutex locked. Than at the end, main will simply sum them up after pthread_join.
 
 
 BONUS-Q. If you attempt the bonus, explain why queue_shutdown() must occur only after ALL producer threads have terminated.
+Answer:
+Shutdown should be last process logically as it should function as disabler and must disable everything before going to sleep. Such that shutdown==meaning 0 active process is satified.
+So, to stop this random flow of codes, ordering has to be: join all producers and than queue_shutdown finally join all consumers. First join all producer threads with pthread_join so all P*K jobs are safely inside queue. Than call queue_shutdown() once so consumers know no wake-up signal or new jobs will be there. Than join all printer threads after queue is drained and they exit. #as  if shutdown occurs before joining procedures q-> shutdown =1 which will generate work. and queue_push() will fail and rejecting valid and genuiune jobs and if consum joined before shutdown than, shutdown will be caught in queue indefinityely because no shutdown signal was broadcasr which will cause parent thread to deadlock at pthreadjoin(consumer).
+

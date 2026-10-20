@@ -16,6 +16,13 @@ typedef struct {
     long jobs_completed;
 } worker_arg_t;
 
+typedef struct {
+    int p_id;
+    long cnt;
+    job_queue_t *q;
+    int err;
+} prod_info_t; //struct for bonus producer args
+
 static void simulate_printing(void)
 {
     struct timespec ts = {.tv_sec = 0, .tv_nsec = 1000000L}; /* 1 ms */
@@ -27,13 +34,33 @@ static void *printer_worker(void *arg)
     worker_arg_t *w = (worker_arg_t *)arg;
     int job = 0;
 
+// queue_pop returns 1 while there are jobs and 0 only when shutdown is 1 and count is 0 so all queued jobs get drained before thread exits
     while (queue_pop(w->queue, &job)) {
         simulate_printing();
-        w->jobs_completed++;
+        w->jobs_completed++; //private counter per worker avoids mutex contention on every job
         printf("PROCESSED job=%d printer=%d\n", job, w->id);
         fflush(stdout);
     }
 
+    return NULL;
+}
+
+static void *prod_fn(void *arg)
+{
+    prod_info_t *info = (prod_info_t *)arg;
+
+// calc unique job id using p_id * cnt + i + 1 so ids go from 1 to P*K w/o needing a separate mutex just for job numbers
+    for (long i = 0; i < info->cnt; i++) {
+        int j_id = (int)(info->p_id* info->cnt + i + 1); //1-indexed positive id
+        if (queue_push(info->q, j_id) != 0) {
+            fprintf(stderr, "Failed to submit job %d\n", j_id);
+            info->err =1;
+            return NULL;
+        }
+        // exact string for autograder do not change
+        printf("SUBMITTED producer=%d job=%d\n", info->p_id, j_id);
+        fflush(stdout);
+    }
     return NULL;
 }
 
@@ -60,34 +87,64 @@ static int run_core_server(long num_jobs)
         return EXIT_FAILURE;
     }
 
-    (void)printer_worker;
-
     /* TODO C13:
      * Initialize workers[i] and create NUM_PRINTERS printer_worker threads.
      */
-    (void)printers;
-    (void)workers;
+// pass &workers[i] instead of &i otherwise loop changes i before thread reads it like in lec 14 slides
+    for (int i = 0; i < NUM_PRINTERS; i++) {
+        workers[i].id = i;
+        workers[i].queue = &queue; //all 4 printers share same queue address
+        workers[i].jobs_completed =0;
+        if (pthread_create(&printers[i], NULL, printer_worker, &workers[i]) != 0) {
+            fprintf(stderr, "pthread_create failed\n");
+            queue_shutdown(&queue);
+            for (int j = 0; j < i; j++) {
+                pthread_join(printers[j], NULL); //reap already started threads on error
+            }
+            queue_destroy(&queue);
+            return EXIT_FAILURE;
+        }
+    }
 
     for (long job = 1; job <= num_jobs; job++) {
         if (queue_push(&queue, (int)job) != 0) {
             fprintf(stderr, "Failed to submit job %ld\n", job);
             queue_shutdown(&queue);
+            for (int i = 0; i < NUM_PRINTERS; i++) {
+                pthread_join(printers[i], NULL);
+            }
             queue_destroy(&queue);
             return EXIT_FAILURE;
         }
         printf("SUBMITTED job=%ld\n", job);
+        fflush(stdout); //flush so output doesnt get mixed up
     }
 
     /* TODO C14: request graceful shutdown after the last submission. */
+    queue_shutdown(&queue); //only after all N pushed
 
     /* TODO C15: join all printer threads. */
-
-    long total = 0;
+// if main returns w/o join the whole process dies and kills worker threads mid print
+    int join_err = 0;
     for (int i = 0; i < NUM_PRINTERS; i++) {
-        total += workers[i].jobs_completed;
+        if (pthread_join(printers[i], NULL) != 0) {
+            fprintf(stderr, "pthread_join failed\n");
+            join_err = 1;
+        }
+    }
+    if (join_err) {
+        queue_destroy(&queue);
+        return EXIT_FAILURE;
     }
 
+    long total= 0;
+    for (int i = 0; i < NUM_PRINTERS; i++) {
+        total += workers[i].jobs_completed; //sum local counts after join
+    }
+    // sanity check total should equal num_jobs (50 by default)
+
     printf("TOTAL_COMPLETED %ld\n", total);
+    fflush(stdout);
 
     queue_destroy(&queue);
     return (total == num_jobs) ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -119,10 +176,102 @@ static int run_core_server(long num_jobs)
  */
 static int run_bonus_server(long producers, long jobs_per_producer)
 {
-    (void)producers;
-    (void)jobs_per_producer;
-    fprintf(stderr, "BONUS_NOT_IMPLEMENTED\n");
-    return 2;
+    job_queue_t q;
+    pthread_t printers[NUM_PRINTERS];
+    worker_arg_t workers[NUM_PRINTERS] = {0};
+
+    if (queue_init(&q) != 0) {
+        fprintf(stderr, "queue_init failed\n");
+        return EXIT_FAILURE;
+    }
+
+    pthread_t *p_tids = malloc(sizeof(pthread_t) * (size_t)producers); //heap alloc since P is runtime arg
+    prod_info_t *p_args = malloc(sizeof(prod_info_t) * (size_t)producers);
+    if (p_tids == NULL || p_args == NULL) {
+        free(p_tids);
+        free(p_args);
+        queue_destroy(&q);
+        return EXIT_FAILURE;
+    }
+
+    for (int i = 0; i < NUM_PRINTERS; i++) {
+        workers[i].id = i;
+        workers[i].queue= &q;
+        workers[i].jobs_completed = 0;
+        if (pthread_create(&printers[i], NULL, printer_worker, &workers[i]) != 0) {
+            fprintf(stderr, "pthread_create printer failed\n");
+            queue_shutdown(&q);
+            for (int j = 0; j < i; j++) {
+                pthread_join(printers[j], NULL);
+            }
+            free(p_tids);
+            free(p_args);
+            queue_destroy(&q);
+            return EXIT_FAILURE;
+        }
+    }
+
+// no global producer lock needed here since queue_push already locks q->mutex internally
+    for (long idx = 0; idx < producers; idx++) {
+        p_args[idx].p_id = (int)idx; //producer ids 0..P-1
+        p_args[idx].cnt =jobs_per_producer;
+        p_args[idx].q = &q;
+        p_args[idx].err= 0;
+        if (pthread_create(&p_tids[idx], NULL, prod_fn, &p_args[idx]) != 0) {
+            fprintf(stderr, "pthread_create producer failed\n");
+            queue_shutdown(&q);
+            for (long j = 0; j < idx; j++) {
+                pthread_join(p_tids[j], NULL);
+            }
+            for (int i = 0; i < NUM_PRINTERS; i++) {
+                pthread_join(printers[i], NULL);
+            }
+            free(p_tids);
+            free(p_args);
+            queue_destroy(&q);
+            return EXIT_FAILURE;
+        }
+    }
+
+    int bad = 0;
+// have to join all producer threads before calling shutdown otherwise if one finishes early and shuts down the rest get rejected
+    for (long idx = 0; idx < producers; idx++) {
+        if (pthread_join(p_tids[idx], NULL) != 0) {
+            fprintf(stderr, "pthread_join producer failed\n");
+            bad = 1;
+        }
+        if (p_args[idx].err != 0) {
+            bad = 1;
+        }
+    }
+    // ordering: join all producers -> queue_shutdown -> join all consumers
+
+    queue_shutdown(&q); //now safe to shutdown
+
+    for (int i = 0; i < NUM_PRINTERS; i++) {
+        if (pthread_join(printers[i], NULL) != 0) {
+            fprintf(stderr, "pthread_join printer failed\n");
+            bad = 1;
+        }
+    }
+
+    long tot= 0;
+    for (int i = 0; i < NUM_PRINTERS; i++) {
+        tot = tot + workers[i].jobs_completed;
+    }
+
+    // expected is P * K (e.g. 3 * 25 = 75)
+    printf("TOTAL_COMPLETED %ld\n", tot);
+    fflush(stdout);
+
+    free(p_tids);
+    free(p_args);
+    queue_destroy(&q);
+
+    if (bad == 0 && tot == producers * jobs_per_producer) {
+        return EXIT_SUCCESS;
+    }
+    return EXIT_FAILURE;
 }
 
 int main(int argc, char *argv[])

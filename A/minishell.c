@@ -25,17 +25,27 @@ static int parse_command(char *line, char *args[])
 
 static void execute_external(char *args[])
 {
-    (void)args;
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return;
+    }
 
-    /* TODO A3-A5:
-     * 1. fork() a child.
-     * 2. In the child, call execvp(args[0], args).
-     * 3. If execvp() fails, print an error and terminate ONLY the child.
-     * 4. In the parent, wait for that specific child using waitpid().
-     * 5. Handle fork()/waitpid() errors.
-     */
+    if (pid == 0) {
+        /* child: replace its image with the command */
+        execvp(args[0], args);
+        perror(args[0]);
+        _exit(127); /* terminate only the child, never return into the shell loop */
+    }
 
-    fprintf(stderr, "TODO: external command execution is not implemented\n");
+    /* parent: wait for specific child, retry if interrupted by a signal */
+    int status;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            perror("waitpid");
+            return;
+        }
+    }
 }
 
 int main(void)
@@ -59,20 +69,20 @@ int main(void)
         }
 
         if (strcmp(args[0], "exit") == 0) {
-            /* TODO A1: terminate the shell process cleanly. */
+            exit(0);
         }
 
         if (strcmp(args[0], "cd") == 0) {
-            /* TODO A2:
-             * - cd must be handled by the shell process itself.
-             * - Require exactly one directory argument.
-             * - Use chdir().
-             * - Use perror("cd") if chdir() fails.
-             * - Do not fall through to execute_external().
-             */
+            if (argc != 2) {
+                fprintf(stderr, "cd: usage: cd <directory>\n");
+            } else if (chdir(args[1]) != 0) {
+                perror("cd");
+            }
+            continue; /* never fall through to execute_external() */
         }
 
         execute_external(args);
+    }
     }
 
     return 0;

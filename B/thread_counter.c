@@ -22,15 +22,19 @@ static void *counter_worker(void *arg)
 
     for (long i = 0; i < w->iterations; i++) {
         if (w->use_mutex) {
-            /* TODO C1: lock counter_mutex. */
+            if (pthread_mutex_lock(&counter_mutex) != 0) {
+                fprintf(stderr, "pthread_mutex_lock failed\n");
+                exit(EXIT_FAILURE);
+            }
         }
 
-        /* TODO B1: increment total_jobs exactly once per iteration.
-         * In unsafe mode this increment is intentionally unsynchronized.
-         */
+        total_jobs++; //unsafe mode: intentionally unsynchronized 
 
         if (w->use_mutex) {
-            /* TODO C2: unlock counter_mutex. */
+            if (pthread_mutex_unlock(&counter_mutex) != 0) {
+                fprintf(stderr, "pthread_mutex_unlock failed\n");
+                exit(EXIT_FAILURE);
+            }
         }
     }
 
@@ -69,19 +73,25 @@ int main(int argc, char *argv[])
     worker_arg_t args[MAX_THREADS];
 
     total_jobs = 0;
-    (void)counter_worker;
-    (void)counter_mutex;
 
-    /* TODO B2:
-     * Initialize args[i] and create nthreads workers using pthread_create().
-     * On failure, print an error and exit.
-     */
-    (void)threads;
-    (void)args;
+    // args[i] lives in main's frame until after the joins, so pointers stay valid 
+    for (long i = 0; i < nthreads; i++) {
+        args[i].iterations = iterations;
+        args[i].use_mutex = use_mutex;
+        int rc = pthread_create(&threads[i], NULL, counter_worker, &args[i]);
+        if (rc != 0) {
+            fprintf(stderr, "pthread_create failed: %s\n", strerror(rc));
+            exit(EXIT_FAILURE);
+        }
+    }
 
-    /* TODO B3:
-     * Join all created workers using pthread_join().
-     */
+    for (long i = 0; i < nthreads; i++) {
+        int rc = pthread_join(threads[i], NULL);
+        if (rc != 0) {
+            fprintf(stderr, "pthread_join failed: %s\n", strerror(rc));
+            exit(EXIT_FAILURE);
+        }
+    }
 
     long expected = nthreads * iterations;
     printf("Mode: %s\n", mode);
